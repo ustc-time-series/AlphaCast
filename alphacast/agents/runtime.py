@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
-from castmind.config import DatasetConfig, ExperimentConfig
+from alphacast.config import DatasetConfig, ExperimentConfig
 from .common import (
     assess_forecast,
     deterministic_run_for_dataset,

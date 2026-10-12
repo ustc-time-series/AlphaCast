@@ -8,23 +8,23 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from castmind.config import DatasetConfig, ExperimentConfig
-from castmind.data_loader import TIME_COL, infer_target_column
-from castmind.eval import align_predictions, mae, mse, smape
-from castmind.features import extract_target_features, extract_exogenous_features
-from castmind.features.extract_exogenous import (
+from alphacast.config import DatasetConfig, ExperimentConfig
+from alphacast.data_loader import TIME_COL, infer_target_column
+from alphacast.eval import align_predictions, mae, mse, smape
+from alphacast.features import extract_target_features, extract_exogenous_features
+from alphacast.features.extract_exogenous import (
     EXOGENOUS_BASES,
     EXOGENOUS_DESCRIPTIONS,
     _find_station_columns,
 )
-from castmind.tools.analysis import (
+from alphacast.tools.analysis import (
     analyze_training,
     choose_cluster_by_similarity,
     choose_model_by_similarity,
     choose_neighbor_by_similarity,
 )
-from castmind.tools.forecast import forecast_with_model, save_predictions_csv
-from castmind.utils.time import (
+from alphacast.tools.forecast import forecast_with_model, save_predictions_csv
+from alphacast.utils.time import (
     CaseEntry,
     CaseNeighbor,
     ClusterEntry,

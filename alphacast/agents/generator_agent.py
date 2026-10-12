@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 from pydantic_ai import Agent, RunContext  # type: ignore
 
-from castmind.config import DatasetConfig, ExperimentConfig
-from castmind.data_loader import TIME_COL
+from alphacast.config import DatasetConfig, ExperimentConfig
+from alphacast.data_loader import TIME_COL
 from .prompts import get_agent_instructions
 
 

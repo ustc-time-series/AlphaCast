@@ -59,7 +59,7 @@ AlphaCast consistently achieves the best performance across most datasets, demon
 
 **Student Contributors**: [**Xiaohan Zhang**](https://github.com/echo01-ai), [**Tian Gao**](https://github.com/SkyeGT), [**Bokai Pan**](https://github.com/Forever-Pan), [**Ze Guo**](https://github.com/Kawai1Angel), [**Yaguo Liu**](https://github.com/liuyaguo), [**Xiaoyu Tao**](https://github.com/Xiaoyu-Tao), [**Jiahao Wang**](https://github.com/realwangjiahao)
 
-**Supervisors**: [**Mingyue Cheng**](https://mingyue-cheng.github.io/)
+**Supervisors**: [**Mingyue Cheng**](https://mingyue-cheng.github.io/), [**Qi Liu**](http://staff.ustc.edu.cn/~qiliuql/) 
 
 **Affiliation**: **State Key Laboratory of Cognitive Intelligence, University of Science and Technology of China**
 

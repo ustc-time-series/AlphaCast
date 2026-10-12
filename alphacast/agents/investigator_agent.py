@@ -8,7 +8,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, TextPart  # type: ignore
 from pydantic_ai.models.function import FunctionModel  # type: ignore
 
-from castmind.config import DatasetConfig, ExperimentConfig
+from alphacast.config import DatasetConfig, ExperimentConfig
 from .prompts import get_agent_instructions
 
 
