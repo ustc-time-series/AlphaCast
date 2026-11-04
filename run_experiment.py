@@ -342,8 +342,8 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                 llm_failed = False
                 early_stop_due_to_bounds = False
 
-                while current_collected < total_needed:
-                    step_horizon = min(horizon, total_needed - current_collected)
+                while current_len < total_len:
+                    step_horizon = min(horizon, total_len - current_len)
                     window_offset = current_len
 
                     prompt_sections: List[str] = []
@@ -471,7 +471,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
 
                     new_collected = unique_count
                     added = new_collected - current_collected
-                    if added <= 0:
+                    if added <= 0 and stride >= horizon:
                         print(
                             f"[warn] No additional predictions were added for dataset '{ds.name}' at step {step_index}."
                         )
@@ -499,7 +499,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         f"[info] Dataset '{ds.name}': collected {current_collected}/{total_needed} predictions via LLM."
                     )
 
-                if not llm_failed and (current_collected >= total_needed or early_stop_due_to_bounds):
+                if not llm_failed and (current_len >= total_len or early_stop_due_to_bounds):
                     clear_resume_state(ds_out_dir)
                     pred_df_full = pd.read_csv(out_csv)
                     if "time_stamp" in pred_df_full.columns:
