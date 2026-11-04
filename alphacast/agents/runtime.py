@@ -60,6 +60,8 @@ def clear_resume_state(ds_out_dir: str) -> None:
 def build_agent_or_none(
     cfg: ExperimentConfig | None = None,
     dataset_briefings: Optional[Dict[str, str]] = None,
+    *,
+    stop_after_emit: bool = False,
 ):
     load_dotenv(override=False)
 
@@ -74,7 +76,7 @@ def build_agent_or_none(
         os.environ["OPENAI_API_BASE"] = openai_base_url
 
     if not (model_name and ":" in model_name):
-        return None
+        raise ValueError("PYA_MODEL or MODEL must identify an LLM")
 
     try:
         briefing_lookup: Dict[str, str] = dataset_briefings or {}
@@ -101,12 +103,13 @@ def build_agent_or_none(
             json_default,
             reflector_agent,
             deterministic_run_for_dataset,
+            stop_after_emit=stop_after_emit,
         )
         if model_name.startswith("openai:") and openai_base_url:
             print(f"[info] Using OpenAI base URL: {openai_base_url}")
         return generator_agent
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError("Failed to initialize AlphaCast agents") from exc
 
 
 __all__ = [

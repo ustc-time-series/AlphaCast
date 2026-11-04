@@ -157,8 +157,12 @@ def prepare_investor_packet(
             if clusters:
                 best_cluster = choose_cluster_by_similarity(clusters, np.asarray(window_vals, dtype=float))
                 best_model, total_weight = best_cluster.best_model, best_cluster.total_weight
+                total_weight = sum(best_model.values())
+                if total_weight <= 0 or any(weight <= 0 for weight in best_model.values()):
+                    raise ValueError("Cluster weights must be positive")
+                aggregate = np.zeros(ref_horizon, dtype=float)
                 for model_name in best_model:
-                    weight = 1.0 * best_model[model_name] / total_weight
+                    weight = float(best_model[model_name]) / total_weight
                     model_pred = forecast_with_model(
                         model_name,
                         np.asarray(window_vals, dtype=float),
@@ -167,14 +171,15 @@ def prepare_investor_packet(
                         dataset=ds_cfg,
                         timestamps=window_ts,
                     ).tolist()
-                    if reference_prediction is None:
-                        reference_prediction = [0.0] * ref_horizon
-                    for i in range(ref_horizon):
-                        reference_prediction[i] = reference_prediction[i] + weight * model_pred[i]
+                    values = np.asarray(model_pred, dtype=float)
+                    if values.shape != (ref_horizon,) or not np.isfinite(values).all():
+                        raise ValueError(f"Invalid cluster member prediction: {model_name}")
+                    aggregate += weight * values
+                reference_prediction = aggregate.tolist()
                 if reference_prediction is not None:
                     recommended_model = "cluster-weighted"
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("Cluster aggregation failed; refusing a partial forecast") from exc
 
     if not reference_prediction:
         if case_base_raw:

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from textwrap import dedent, indent
 from typing import Dict, List, Optional
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,41 @@ from alphacast.agents.runtime import (
 from alphacast.eval import align_predictions, mae, mse, smape
 from alphacast.tools.analysis import analyze_training
 from alphacast.features import extract_target_features, extract_exogenous_features
+from alphacast.utils.predictions import atomic_csv, discard_window, saved_window, window_rows
+
+
+def _save_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _complete_predictions(path, test_df, look_back, horizon, stride):
+    frame = pd.read_csv(path)
+    length = len(test_df) - look_back
+    offsets = list(range(0, length, stride))
+    if 'window_offset' not in frame or set(frame.window_offset) != set(offsets):
+        raise ValueError('Forecast origins do not match the complete test protocol')
+    chunks = []
+    for offset in offsets:
+        size = min(horizon, length - offset)
+        timestamps = test_df[TIME_COL].iloc[offset + look_back:offset + look_back + size]
+        chunks.append(window_rows(frame, offset, size, timestamps))
+    clean = pd.concat(chunks, ignore_index=True)
+    clean['time_stamp'] = pd.to_datetime(clean['time_stamp'], format='mixed')
+    if len(clean) != len(frame):
+        # Keep the original before repairing legacy duplicate submissions.
+        backup = Path(str(path) + f'.before_dedup_{time.time_ns()}')
+        backup.write_bytes(Path(path).read_bytes())
+        atomic_csv(clean, path)
+    return clean
 
 
 def _load_dataset_brief(path: Optional[str]) -> str:
@@ -82,7 +118,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
     mode = os.getenv("ORCHESTRATION_MODE", "llm").lower()
     use_agent = mode == "llm"
 
-    agent = build_agent_or_none(cfg, dataset_briefings) if use_agent else None
+    agent = build_agent_or_none(cfg, dataset_briefings, stop_after_emit=True) if use_agent else None
     if use_agent and agent is None:
         print("[warn] LLM orchestration unavailable or misconfigured; falling back to deterministic mode.")
 
@@ -240,6 +276,11 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
         resume_required = False
 
         if agent is not None:
+            old_metrics = Path(ds_out_dir) / 'evaluation_metrics.json'
+            if old_metrics.exists():
+                old_metrics.replace(Path(str(old_metrics) + f'.previous_{time.time_ns()}'))
+            _save_json(Path(ds_out_dir) / 'evaluation_status.json',
+                       dict(status='running', dataset=ds.name))
             resume_state = load_resume_state(ds_out_dir)
             if resume_state is None and os.path.exists(out_csv):
                 os.remove(out_csv)
@@ -279,9 +320,9 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         ]
                     )
 
-                # Use integer prediction budget equal to remaining target length
-                # to avoid float slicing and overshoot from overlapping windows.
-                total_needed = int(total_len)
+                planned = {off + j for off in range(0, total_len, stride)
+                           for j in range(min(horizon, total_len - off))}
+                total_needed = len(planned)
                 current_len = 0
                 current_collected = 0
                 step_index = 0
@@ -302,20 +343,16 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         pass
 
                 if resume_state_valid:
-                    stored_total_needed = resume_state.get("total_needed")
-                    if stored_total_needed is not None:
-                        try:
-                            total_needed = int(stored_total_needed)
-                        except Exception:
-                            total_needed = int(total_len)
-                    current_len = int(resume_state.get("current_len", 0))
-                    step_index = int(resume_state.get("step_index", 0))
-                    current_collected = int(resume_state.get("current_collected", 0))
+                    # Scan from the first origin; complete saved windows are reused.
+                    # This repairs stale counters without repeating successful API calls.
+                    current_len = 0
+                    step_index = 0
+                    current_collected = 0
                     if os.path.exists(out_csv):
                         try:
                             _existing = pd.read_csv(out_csv)
                             if "time_stamp" in _existing.columns and len(_existing) > 0:
-                                _existing["time_stamp"] = pd.to_datetime(_existing["time_stamp"])
+                                _existing["time_stamp"] = pd.to_datetime(_existing["time_stamp"], format='mixed')
                                 existing_unique = (
                                     _existing.sort_values("time_stamp", kind="mergesort")
                                     .drop_duplicates(subset=["time_stamp"], keep="last")
@@ -342,8 +379,8 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                 llm_failed = False
                 early_stop_due_to_bounds = False
 
-                while current_collected < total_needed:
-                    step_horizon = min(horizon, total_needed - current_collected)
+                while current_len < total_len:
+                    step_horizon = min(horizon, total_len - current_len)
                     window_offset = current_len
 
                     prompt_sections: List[str] = []
@@ -388,30 +425,41 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
 
                     net_failures = 0
                     other_failures = 0
+                    expected_times = test_df[TIME_COL].iloc[
+                        window_offset + look_back:window_offset + look_back + step_horizon
+                    ]
                     while True:
+                        # A valid committed window survives errors after writing and process restarts.
+                        if saved_window(out_csv, window_offset, step_horizon, expected_times) is not None:
+                            break
+                        discard_window(out_csv, window_offset)
                         try:
                             agent.run_sync(prompt)
+                            if saved_window(out_csv, window_offset, step_horizon, expected_times) is None:
+                                raise ValueError("Agent ended without a complete valid forecast")
                             break
                         except Exception as exc:
+                            # Includes the local ForecastCommitted stop signal; verify the file first.
+                            if saved_window(out_csv, window_offset, step_horizon, expected_times) is not None:
+                                print(f"[info] Dataset '{ds.name}' step {step_index}: committed forecast recovered.")
+                                break
+                            discard_window(out_csv, window_offset)
                             if _is_network_error(exc) and net_failures < max_net_failures:
                                 net_failures += 1
-                                print(
-                                    f"[warn] Network error during LLM call for dataset '{ds.name}' step {step_index} (attempt {net_failures}/{max_net_failures}). Retrying..."
-                                )
+                                print(f"[warn] Network error for '{ds.name}' step {step_index}; retry {net_failures}/{max_net_failures}.")
                                 time.sleep(1.0)
                                 continue
                             if not _is_network_error(exc) and other_failures < max_other_failures:
                                 other_failures += 1
-                                print(
-                                    f"[warn] LLM call failed for dataset '{ds.name}' step {step_index} (attempt {other_failures}/{max_other_failures}): {exc}. Retrying..."
-                                )
+                                print(f"[warn] Invalid/incomplete forecast for '{ds.name}' step {step_index}; retry {other_failures}/{max_other_failures}: {exc}")
                                 time.sleep(1.0)
                                 continue
-                            print(
-                                f"[warn] LLM orchestration failed for dataset '{ds.name}' step {step_index}: {exc}. Saving progress for resume."
-                            )
+                            print(f"[warn] LLM orchestration failed for '{ds.name}' step {step_index}: {exc}")
                             llm_failed = True
                             resume_required = True
+                            _save_json(Path(ds_out_dir) / 'evaluation_status.json',
+                                       dict(status='incomplete', dataset=ds.name,
+                                            window_offset=window_offset, error=str(exc)))
                             break
 
                     if llm_failed:
@@ -434,7 +482,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         resume_required = True
                         break
 
-                    pred_df_full["time_stamp"] = pd.to_datetime(pred_df_full["time_stamp"])
+                    pred_df_full["time_stamp"] = pd.to_datetime(pred_df_full["time_stamp"], format='mixed')
                     unique_pred_df = (
                         pred_df_full.sort_values("time_stamp", kind="mergesort")
                         .drop_duplicates(subset=["time_stamp"], keep="last")
@@ -449,36 +497,18 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         )
                         break
                         
-                    with open(os.path.join(ds_out_dir, "basemodel_results.json"), "r", encoding="utf-8") as f:
-                        basemodel_results = json.load(f) or []
-                        
-                    new_result = basemodel_results[-1] if basemodel_results else {}
-                    if new_result and 'start_timestamp' not in new_result:
-                        idx = current_len + look_back
-                        if idx < len(test_df):
-                            new_result['start_timestamp'] = test_df[TIME_COL].iloc[idx].isoformat()
-                        else:
-                            # Out-of-bounds start; stop and evaluate with current results
-                            early_stop_due_to_bounds = True
-                            print(
-                                f"[warn] Start timestamp index {idx} is out-of-bounds for dataset '{ds.name}'. Stopping predictions and proceeding to evaluation."
+                    base_path = Path(ds_out_dir) / "basemodel_results.json"
+                    if base_path.exists():
+                        basemodel_results = json.loads(base_path.read_text()) or []
+                        if basemodel_results and isinstance(basemodel_results[-1], dict):
+                            basemodel_results[-1].setdefault(
+                                'start_timestamp', expected_times.iloc[0].isoformat()
                             )
-                            break
-                        
-                    basemodel_results[-1] = new_result
-                    with open(os.path.join(ds_out_dir, "basemodel_results.json"), "w", encoding="utf-8") as f:
-                        json.dump(basemodel_results, f, indent=2)
+                            _save_json(base_path, basemodel_results)
 
                     new_collected = unique_count
-                    added = new_collected - current_collected
-                    if added <= 0:
-                        print(
-                            f"[warn] No additional predictions were added for dataset '{ds.name}' at step {step_index}."
-                        )
-                        llm_failed = True
-                        resume_required = True
-                        break
-
+                    # Per-origin validation above is authoritative. A reused or overlapping
+                    # window may legitimately add no new unique timestamps.
                     current_collected = new_collected
                     current_len += stride
                     step_index += 1
@@ -499,29 +529,31 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         f"[info] Dataset '{ds.name}': collected {current_collected}/{total_needed} predictions via LLM."
                     )
 
-                if not llm_failed and (current_collected >= total_needed or early_stop_due_to_bounds):
+                if not llm_failed and (current_len >= total_len or early_stop_due_to_bounds):
+                    try:
+                        pred_df_full = _complete_predictions(
+                            out_csv, test_df, look_back, horizon, stride
+                        )
+                        y_true, y_pred = align_predictions(target_df, pred_df_full, ds.name)
+                        if len(y_true) != len(pred_df_full) or not len(y_true):
+                            raise ValueError("Not all emitted rows match finite test targets")
+                        if not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
+                            raise ValueError("Non-finite evaluation arrays")
+                    except Exception as exc:
+                        _save_json(Path(ds_out_dir) / 'evaluation_status.json',
+                                   dict(status='verification_failed', dataset=ds.name, error=str(exc)))
+                        print(f"[warn] Dataset '{ds.name}' evaluation rejected: {exc}")
+                        continue
+                    evaluation = dict(dataset=ds.name, MSE=mse(y_true, y_pred),
+                                      MAE=mae(y_true, y_pred), sMAPE=smape(y_true, y_pred),
+                                      model='LLM', forecast_windows=len(range(0, total_len, stride)),
+                                      evaluated_points=len(y_true),
+                                      unique_evaluated_points=int(pred_df_full.time_stamp.nunique()),
+                                      look_back=look_back, horizon=horizon, stride=stride)
+                    _save_json(Path(ds_out_dir) / 'evaluation_metrics.json', evaluation)
+                    _save_json(Path(ds_out_dir) / 'evaluation_status.json',
+                               dict(status='completed', dataset=ds.name, metrics=evaluation))
                     clear_resume_state(ds_out_dir)
-                    pred_df_full = pd.read_csv(out_csv)
-                    if "time_stamp" in pred_df_full.columns:
-                        pred_df_full["time_stamp"] = pd.to_datetime(pred_df_full["time_stamp"])
-                        unique_pred_df = (
-                            pred_df_full.sort_values("time_stamp", kind="mergesort")
-                            .drop_duplicates(subset=["time_stamp"], keep="last")
-                            .reset_index(drop=True)
-                        )
-                        if len(unique_pred_df) < total_needed:
-                            print(
-                                f"[warn] Dataset '{ds.name}': only {len(unique_pred_df)} unique timestamps collected (expected {total_needed}). Evaluation will proceed with available data."
-                            )
-                        elif len(unique_pred_df) > total_needed:
-                            print(
-                                f"[info] Dataset '{ds.name}': collected {len(unique_pred_df)} unique timestamps; evaluation will use full emission history while reporting metrics."
-                            )
-                    else:
-                        print(
-                            f"[warn] Dataset '{ds.name}': predictions file missing 'time_stamp' column during evaluation; attempting best-effort alignment."
-                        )
-                    y_true, y_pred = align_predictions(target_df, pred_df_full, ds.name)
                     rows.append(
                         {
                             "dataset": ds.name,
@@ -611,8 +643,14 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
         rows.append(deterministic_run_for_dataset(cfg, ds))
 
     summary = pd.DataFrame(rows)
+    columns = ['dataset', 'MSE', 'MAE', 'sMAPE', 'model']
+    summary = summary.reindex(columns=columns)
+    atomic_csv(summary, Path(cfg.output_dir) / 'metrics.csv')
+    _save_json(Path(cfg.output_dir) / 'metrics.json', summary.to_dict(orient='records'))
     print("\n=== Experiment Summary ===")
     print(summary.to_string(index=False))
+    if use_agent and sum(row.get('model') == 'LLM' for row in rows) != len(cfg.datasets):
+        raise RuntimeError('Incomplete LLM evaluation; inspect dataset evaluation_status.json files')
 
 
 if __name__ == "__main__":
