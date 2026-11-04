@@ -25,11 +25,19 @@ _NUMBER_PATTERN = re.compile(
     r"(?P<number>-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?)(?P<percent>%?)"
 )
 _WINDOW_CLAIM_PATTERN = re.compile(
-    r"\b(?:window|horizon|steps?|points?)\b[^\d\-]{0,12}(-?\d+(?:\.\d+)?)",
+    r"\bhorizon\b[^\d\-]{0,12}(-?\d+(?:\.\d+)?)"
+    r"|"
+    r"\b(?:prediction|forecast|output)\s+(?:window|steps?|points?)\b[^\d\-]{0,12}(-?\d+(?:\.\d+)?)"
+    r"|"
+    r"\b(?:predict|forecast|generat(?:e|ing))\s+(-?\d+(?:\.\d+)?)\s*\b(?:steps?|points?)\b"
+    r"|"
+    r"\b(?:window|steps?|points?)\s+(?:of|is)[^\d\-]{0,8}(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _BASELINE_CLAIM_PATTERN = re.compile(
-    r"\b(?:baseline|reference)\b[^\d\-]{0,16}(-?\d+(?:\.\d+)?)",
+    r"\b(?:baseline)\b[^\d\-]{0,16}(-?\d+(?:\.\d+)?)"
+    r"|"
+    r"\breference\s+(?:(?:mean|avg|value|level|last|final)\b)[^\d\-]{0,12}(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
@@ -237,6 +245,9 @@ def scan_chain_of_thought(
         if token["is_percent"]:
             continue
         value = float(token["value"])
+        # Skip year-like integers (1900-2099) — common in time-series reasoning
+        if value == int(value) and 1900 <= int(value) <= 2099:
+            continue
         if abs(value) <= max(0.05 * context_magnitude, 1.0) and context_magnitude > 10:
             # Allow small housekeeping numbers when the context scale is large.
             continue
@@ -255,8 +266,11 @@ def scan_chain_of_thought(
 
     window_mismatches: List[Dict[str, Any]] = []
     for match in _WINDOW_CLAIM_PATTERN.finditer(text):
+        raw_claimed = next((g for g in match.groups() if g is not None), None)
+        if raw_claimed is None:
+            continue
         try:
-            claimed = float(match.group(1))
+            claimed = float(raw_claimed)
         except (TypeError, ValueError):
             continue
         if abs(claimed - predicted_window) > 0.5:
@@ -285,9 +299,12 @@ def scan_chain_of_thought(
 
     if baseline_stats:
         for match in _BASELINE_CLAIM_PATTERN.finditer(text):
+            raw_claimed = next((g for g in match.groups() if g is not None), None)
+            if raw_claimed is None:
+                continue
             snippet = text[max(0, match.start() - 40) : min(len(text), match.end() + 40)].strip()
             try:
-                claimed = float(match.group(1))
+                claimed = float(raw_claimed)
             except (TypeError, ValueError):
                 continue
             reference_type = "mean"
