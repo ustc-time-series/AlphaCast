@@ -7,10 +7,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from pydantic_ai import Agent, RunContext  # type: ignore
+from pydantic_ai import Agent, RunContext, ModelRetry  # type: ignore
 
 from alphacast.config import DatasetConfig, ExperimentConfig
 from alphacast.data_loader import TIME_COL
+from alphacast.utils.predictions import ForecastCommitted, commit_window, saved_window
 from .prompts import get_agent_instructions
 
 
@@ -38,9 +39,11 @@ def create_generator_agent(
     json_default: Callable[[Any], Any],
     reflector_agent: Agent,
     deterministic_run_for_dataset: Callable[[ExperimentConfig, Any], dict],
+    *,
+    stop_after_emit: bool = False,
 ) -> Agent:
     instructions = get_agent_instructions("GeneratorAgent", GENERATOR_AGENT_PROMPT_FALLBACK)
-    generator_agent = Agent(model_name, instructions=instructions)
+    generator_agent = Agent(model_name, instructions=instructions, retries=2)
     globals()["RunContext"] = RunContext
 
     investigator_cache: dict[tuple[str, int], dict[str, Any]] = {}
@@ -108,7 +111,7 @@ def create_generator_agent(
         return {"logged": True, "path": path}
 
     @generator_agent.tool
-    def emit_predictions(
+    async def emit_predictions(
         ctx: RunContext[None],
         predictions: List[float],
         training_csv: str,
@@ -133,33 +136,35 @@ def create_generator_agent(
         if n == 0:
             raise ValueError("predictions must be a non-empty list of floats")
         if n != H:
-            print(f"[warn] Normalizing LLM predictions length from {n} to {H} by {'trimming' if n>H else 'padding'}")
-            if n > H:
-                predictions = predictions[:H]
-            else:
-                last_val = float(predictions[-1])
-                predictions = predictions + [last_val] * (H - n)
+            raise ModelRetry(f"Expected exactly {H} predictions; received {n}. Please correct the list.")
         arr = np.asarray(predictions, dtype=float)
         if not np.all(np.isfinite(arr)):
             raise ValueError("predictions must be finite numbers")
 
         ds_cfg = dataset_lookup.get(dataset_name)
+        if ds_cfg is None or training_csv != ds_cfg.training_csv or output_dir != cfg.output_dir:
+            raise ModelRetry("Dataset, training path or output directory differs from the requested configuration")
         investor_packet = investigator_cache.get((dataset_name, window_offset_int))
-        if investor_packet is None and ds_cfg is not None:
-            try:
-                investor_packet = prepare_investor_packet(
-                    cfg,
-                    ds_cfg,
-                    briefing_lookup,
-                    window_offset_int,
-                    H,
-                )
-            except Exception:
-                investor_packet = {}
-        elif investor_packet is None:
-            investor_packet = {}
+        if investor_packet is None:
+            raise ModelRetry("Call consult for this dataset/window before emit_predictions")
 
         chain_text = chain_cache.get((dataset_name, window_offset_int), "")
+        if not chain_text.strip():
+            raise ModelRetry("Call record_chain_of_thought with a concise evidence summary before emitting")
+        out_csv = os.path.join(output_dir, dataset_name, "predictions.csv")
+        expected_start = investor_packet.get("prediction_start_timestamp")
+        expected_horizon = investor_packet.get("forecast_horizon_hint")
+        if expected_horizon and H != int(expected_horizon):
+            raise ModelRetry("Prediction horizon differs from the consulted window")
+        if expected_start and start_timestamp and pd.Timestamp(start_timestamp) != pd.Timestamp(expected_start):
+            raise ModelRetry("Prediction start differs from the consulted window")
+        expected_frequency = ds_cfg.frequency or frequency
+        if expected_start and expected_frequency:
+            expected_times = pd.date_range(expected_start, periods=H, freq=expected_frequency)
+            if saved_window(out_csv, window_offset_int, H, expected_times) is not None:
+                if stop_after_emit:
+                    raise ForecastCommitted("Forecast already saved")
+                return {"ok": True, "already_saved": True, "predictions_saved": out_csv}
         reflection_request = {
             "dataset_name": dataset_name,
             "window_offset": window_offset_int,
@@ -168,21 +173,21 @@ def create_generator_agent(
             "investor_packet": investor_packet or {},
             "chain_of_thought": chain_text,
         }
-        reflection_result = reflector_agent.run_sync(json.dumps(reflection_request, default=json_default))
+        reflection_result = await reflector_agent.run(json.dumps(reflection_request, default=json_default))
         try:
             reflection = json.loads(reflection_result.output)
         except Exception as exc:
             raise RuntimeError(f"ReflectorAgent returned invalid payload: {exc}") from exc
-        if not reflection.get("approved", False):
-            issues = reflection.get("issues") or []
-            notes = reflection.get("notes") or ""
-            joined = ", ".join(str(item) for item in issues)
-            raise RuntimeError(f"ReflectorAgent rejected forecast: {joined} {notes}")
         try:
             with open(os.path.join(_dataset_out_dir(dataset_name), "reflector_report.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps({"window_offset": window_offset_int, **reflection}, ensure_ascii=False) + "\n")
         except Exception:
             pass
+        if not reflection.get("approved", False):
+            issues = reflection.get("issues") or []
+            notes = reflection.get("notes") or ""
+            joined = ", ".join(str(item) for item in issues)
+            raise ModelRetry(f"ReflectorAgent rejected forecast: {joined} {notes}")
 
         ds_out_dir = os.path.join(output_dir, dataset_name)
         os.makedirs(ds_out_dir, exist_ok=True)
@@ -347,7 +352,7 @@ def create_generator_agent(
         if os.path.exists(out_csv):
             existing_df = pd.read_csv(out_csv)
             if len(existing_df) > 0 and "time_stamp" in existing_df.columns:
-                existing_df["time_stamp"] = pd.to_datetime(existing_df["time_stamp"])  # type: ignore
+                existing_df["time_stamp"] = pd.to_datetime(existing_df["time_stamp"], format='mixed')  # type: ignore
                 existing_unique = (
                     existing_df.sort_values("time_stamp", kind="mergesort")
                     .drop_duplicates(subset=["time_stamp"], keep="last")
@@ -434,12 +439,11 @@ def create_generator_agent(
             }
         )
 
-        if existing_df is not None and len(existing_df) > 0:
-            combined = pd.concat([existing_df, new_chunk], ignore_index=True)
-        else:
-            combined = new_chunk
-
-        combined.to_csv(out_csv, index=False)
+        # Recheck on commit as another tool call may have finished during reflection.
+        if not commit_window(out_csv, new_chunk):
+            if stop_after_emit:
+                raise ForecastCommitted("Forecast already saved")
+            return {"ok": True, "already_saved": True, "predictions_saved": out_csv}
 
         meta = {
             "dataset": dataset_name,
@@ -483,9 +487,10 @@ def create_generator_agent(
                 print(f"[info] LLM reported feature usage for dataset '{dataset_name}': {top_msg}")
             except Exception:
                 pass
+        if stop_after_emit:
+            raise ForecastCommitted("Approved forecast saved")
         return {"ok": True, "predictions_saved": out_csv}
 
-    @generator_agent.tool
     def run_pipeline(
         ctx: RunContext[None],
         training_csv: str,
