@@ -44,9 +44,16 @@ conda activate AlphaCast
 pip install -r requirements.txt
 ```
 
-4. **Run experiments**
+4. **Initialize command**
 
 ```bash
+bash scripts/build_case_base.sh --all-datasets --device cuda:0
+```
+
+5. **Run experiments**
+
+```bash
+cd AlphaCast
 python run_experiment.py
 ```
 

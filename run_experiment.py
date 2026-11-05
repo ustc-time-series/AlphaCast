@@ -27,6 +27,33 @@ from alphacast.features import extract_target_features, extract_exogenous_featur
 from alphacast.utils.predictions import atomic_csv, discard_window, saved_window, window_rows
 
 
+_CASE_BASE_FILES = (
+    "memory.json", "case_base.json", "case_neighbor.json",
+    "cluster_base.json", "cases_stats.json",
+)
+
+
+def _load_or_build_case_base(train_df, ds, output_dir, case_base_dir):
+    destination = Path(output_dir) / ds.name
+    # Prefer the initialization directory, then a previous experiment.
+    # Do not compare training data or settings with the existing library.
+    for folder in (Path(case_base_dir) / ds.name, destination):
+        if not all((folder / name).is_file() for name in _CASE_BASE_FILES):
+            continue
+        contents = {name: json.loads((folder / name).read_text(encoding="utf-8"))
+                    for name in _CASE_BASE_FILES}
+        destination.mkdir(parents=True, exist_ok=True)
+        if folder.resolve() != destination.resolve():
+            for name, value in contents.items():
+                _save_json(destination / name, value)
+        return contents["memory.json"]
+    return analyze_training(
+        train_df, int(ds.look_back), int(ds.predicted_window), output_dir,
+        ds.name, ds.sliding_window, method="weighted", num_clusters=6,
+        dataset_cfg=ds,
+    ).memory
+
+
 def _save_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,12 +101,14 @@ def _load_dataset_brief(path: Optional[str]) -> str:
     return text.strip()
 
 
-def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = None) -> None:
+def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = None,
+                   case_base_dir: Optional[str] = None) -> None:
     # Load environment from .env if present
     load_dotenv(override=False)
 
     cfg = load_config(config_path)
     os.makedirs(cfg.output_dir, exist_ok=True)
+    case_base_dir = case_base_dir or str(Path(__file__).resolve().parent / "outputs/case_bases")
 
     selectors = [s.strip().lower() for s in (dataset_selectors or []) if s]
     if selectors:
@@ -124,6 +153,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
 
     rows = []
     for ds in cfg.datasets:
+        case_base_ready = False
         print(f"\n=== Processing dataset: {ds.name} ===")
         dataset_brief = dataset_briefings.get(ds.name, "")
         formatted_brief = ""
@@ -135,33 +165,24 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
             train_df = train_df.sort_values(TIME_COL).reset_index(drop=True)
         except Exception as exc:
             print(f"[warn] Failed to load training data for dataset '{ds.name}': {exc}. Using deterministic fallback.")
-            rows.append(deterministic_run_for_dataset(cfg, ds))
+            rows.append(deterministic_run_for_dataset(cfg, ds, case_base_ready=case_base_ready))
             continue
 
         look_back = int(ds.look_back)
         predicted_window = int(ds.predicted_window)
 
         try:
-            analysis = analyze_training(
-                train_df,
-                look_back,
-                predicted_window,
-                cfg.output_dir,
-                ds.name,
-                ds.sliding_window,
-                method="weighted",
-                num_clusters=6,
-                dataset_cfg=ds,
-            )
+            memory = _load_or_build_case_base(train_df, ds, cfg.output_dir, case_base_dir)
+            case_base_ready = True
         except Exception as exc:
             print(f"[warn] Training analysis failed for dataset '{ds.name}': {exc}. Using deterministic fallback.")
-            rows.append(deterministic_run_for_dataset(cfg, ds))
+            rows.append(deterministic_run_for_dataset(cfg, ds, case_base_ready=case_base_ready))
             continue
 
         ds_out_dir = os.path.join(cfg.output_dir, ds.name)
         frequency = None
-        if isinstance(analysis.memory, dict):
-            frequency = analysis.memory.get("frequency")
+        if isinstance(memory, dict):
+            frequency = memory.get("frequency")
 
         # Dynamically infer the target column for downstream feature computation
         target_col = infer_target_column(train_df, ds.name)
@@ -266,7 +287,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
             test_df = test_df.sort_values(TIME_COL).reset_index(drop=True)
         except Exception as exc:
             print(f"[warn] Failed to load test data for dataset '{ds.name}': {exc}. Using deterministic fallback.")
-            rows.append(deterministic_run_for_dataset(cfg, ds))
+            rows.append(deterministic_run_for_dataset(cfg, ds, case_base_ready=case_base_ready))
             continue
 
         target_df = test_df.iloc[look_back:].reset_index(drop=True)
@@ -640,7 +661,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
         if agent is not None and resume_required:
             continue
 
-        rows.append(deterministic_run_for_dataset(cfg, ds))
+        rows.append(deterministic_run_for_dataset(cfg, ds, case_base_ready=case_base_ready))
 
     summary = pd.DataFrame(rows)
     columns = ['dataset', 'MSE', 'MAE', 'sMAPE', 'model']
@@ -658,6 +679,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run time series agent experiments")
     parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument(
+        "--case-base-dir", type=str,
+        default=str(Path(__file__).resolve().parent / "outputs/case_bases"),
+        help="Reuse initialized libraries here; automatically build missing libraries.",
+    )
     parser.add_argument(
         "--dataset",
         dest="datasets",
@@ -683,4 +709,4 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"Unrecognized argument '{token}'. Use --dataset or known aliases.")
 
-    run_experiment(args.config, selector_tokens if selector_tokens else None)
+    run_experiment(args.config, selector_tokens if selector_tokens else None, args.case_base_dir)
