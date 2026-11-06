@@ -515,21 +515,22 @@ def assess_forecast(
     return summary
 
 
-def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
+def deterministic_run_for_dataset(cfg: ExperimentConfig, ds, *, case_base_ready: bool = False) -> dict:
     # Load training data
     data = pd.read_csv(ds.training_csv)
     data[TIME_COL] = pd.to_datetime(data[TIME_COL])
     data = data.sort_values(TIME_COL).reset_index(drop=True)
 
-    _ = analyze_training(
-        data,
-        ds.look_back,
-        ds.predicted_window,
-        cfg.output_dir,
-        ds.name,
-        ds.sliding_window,
-        dataset_cfg=ds,
-    )
+    if not case_base_ready:
+        _ = analyze_training(
+            data,
+            ds.look_back,
+            ds.predicted_window,
+            cfg.output_dir,
+            ds.name,
+            ds.sliding_window,
+            dataset_cfg=ds,
+        )
     ds_out_dir = os.path.join(cfg.output_dir, ds.name)
     memory_path = os.path.join(ds_out_dir, "memory.json")
     case_base_path = os.path.join(ds_out_dir, "case_base.json")
